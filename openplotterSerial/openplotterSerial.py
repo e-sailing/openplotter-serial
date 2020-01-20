@@ -15,50 +15,40 @@
 # You should have received a copy of the GNU General Public License
 # along with Openplotter. If not, see <http://www.gnu.org/licenses/>.
 
-import wx, os, webbrowser, subprocess, socket, pyudev, re, ujson, time, configparser
+import wx, os, webbrowser, subprocess, re, ujson, sys, time
 import wx.richtext as rt
-
 from openplotterSettings import conf
 from openplotterSettings import language
-# use the class "platform" to get info about the host system. See: https://github.com/openplotter/openplotter-settings/blob/master/openplotterSettings/platform.py
 from openplotterSettings import platform
+from openplotterSettings import selectConnections
+from openplotterSettings import serialPorts
 
 class SerialFrame(wx.Frame):
 	def __init__(self):
-		self.rpitype = ''
-		try:
-			modelfile = open('/sys/firmware/devicetree/base/model', 'r', 2000)
-			self.rpimodel = modelfile.read()[:-1]
-			if self.rpimodel == 'Raspberry Pi Zero W Rev 1.1':
-				self.rpitype = '0W'
-			elif self.rpimodel == 'Raspberry Pi 2 Model B Rev 1.1':
-				self.rpitype = '2B'
-			elif self.rpimodel == 'Raspberry Pi 3 Model B Rev 1.2':
-				self.rpitype = '3B'
-			elif self.rpimodel == 'Raspberry Pi 3 Model B Plus Rev 1.3':
-				self.rpitype = '3B+'
-			elif self.rpimodel == 'Raspberry Pi 4 Model B Rev 1.1':
-				self.rpitype = '4B'				
-			modelfile.close()
-		except:
-			self.rpimodel = ''
-	
 		self.conf = conf.Conf()
-		self.conf_folder = self.conf.conf_folder
-		self.home = self.conf_folder
-		self.home = os.path.expanduser("~")
-		self.SK_settings = SK_settings(self.conf)
-		self.SK = self.SK_settings.installed
-		self.kplex = os.path.exists(self.home +'/.kplex.conf')
-		self.gpsd = os.path.exists('/etc/default/gpsd')
-		self.pypilot = os.path.exists(self.home+'/pypilot_serial_ports')
-		#print(self.SK, self.kplex, self.gpsd, self.pypilot)
+		self.home = self.conf.home
 		self.platform = platform.Platform()
 		self.currentdir = os.path.dirname(__file__)
-		#self.currentdir = '/home/pi/openplotter-serial/openplotterSerial'
 		self.currentLanguage = self.conf.get('GENERAL', 'lang')
 		self.language = language.Language(self.currentdir,'openplotter-serial',self.currentLanguage)
-
+		if self.platform.isRPI:
+			self.rpitype = ''
+			try:
+				modelfile = open('/sys/firmware/devicetree/base/model', 'r', 2000)
+				self.rpimodel = modelfile.read()[:-1]
+				if self.rpimodel == 'Raspberry Pi Zero W Rev 1.1':
+					self.rpitype = '0W'
+				elif self.rpimodel == 'Raspberry Pi 2 Model B Rev 1.1':
+					self.rpitype = '2B'
+				elif self.rpimodel == 'Raspberry Pi 3 Model B Rev 1.2':
+					self.rpitype = '3B'
+				elif self.rpimodel == 'Raspberry Pi 3 Model B Plus Rev 1.3':
+					self.rpitype = '3B+'
+				elif self.rpimodel == 'Raspberry Pi 4 Model B Rev 1.1':
+					self.rpitype = '4B'				
+				modelfile.close()
+			except: self.rpimodel = ''
+	
 		wx.Frame.__init__(self, None, title=_('OpenPlotter Serial'), size=(800,444))
 		self.SetFont(wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
 		icon = wx.Icon(self.currentdir+"/data/openplotter-serial.png", wx.BITMAP_TYPE_PNG)
@@ -74,20 +64,26 @@ class SerialFrame(wx.Frame):
 		if not self.platform.isInstalled('openplotter-doc'): self.toolbar1.EnableTool(101,False)
 		toolSettings = self.toolbar1.AddTool(102, _('Settings'), wx.Bitmap(self.currentdir+"/data/settings.png"))
 		self.Bind(wx.EVT_TOOL, self.OnToolSettings, toolSettings)
-		self.toolbar1.AddStretchableSpace()
-		self.emptyimage = wx.Bitmap(self.currentdir+"/data/empty.png")
-		self.toolbar1.AddTool(105, '', self.emptyimage)
-		self.toolbar1.AddTool(106, '', self.emptyimage)
+		self.toolbar1.AddSeparator()
+		uart = self.toolbar1.AddCheckTool(103, _('UART'), wx.Bitmap(self.currentdir+"/data/uart.png"))
+		self.Bind(wx.EVT_TOOL, self.onUart, uart)
+		if not self.platform.isRPI: self.toolbar1.EnableTool(103,False)
+		try:
+			subprocess.check_output(['systemctl', 'is-active', 'hciuart']).decode(sys.stdin.encoding)
+			self.toolbar1.ToggleTool(103,False)
+		except: self.toolbar1.ToggleTool(103,True)
+		self.toolbar1.AddSeparator()
+		refresh = self.toolbar1.AddTool(104, _('Refresh'), wx.Bitmap(self.currentdir+"/data/refresh.png"))
+		self.Bind(wx.EVT_TOOL, self.onToolRefresh, refresh)
 
 		self.notebook = wx.Notebook(self)
 		self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.onTabChange)
 		self.p_serial = wx.Panel(self.notebook)
 		self.connections = wx.Panel(self.notebook)
-		self.output = wx.Panel(self.notebook)
-		self.notebook.AddPage(self.p_serial, _('Name Serial Port (udev)'))
-		self.notebook.AddPage(self.connections, _('Jump to SignalK settings or Setup GPIO Serial Port'))
+		self.notebook.AddPage(self.p_serial, _('Devices'))
+		self.notebook.AddPage(self.connections, _('Connections'))
 		self.il = wx.ImageList(24, 24)
-		img0 = self.il.Add(wx.Bitmap(self.currentdir+"/data/openplotter-24.png", wx.BITMAP_TYPE_PNG))
+		img0 = self.il.Add(wx.Bitmap(self.currentdir+"/data/usb.png", wx.BITMAP_TYPE_PNG))
 		img1 = self.il.Add(wx.Bitmap(self.currentdir+"/data/connections.png", wx.BITMAP_TYPE_PNG))
 		self.notebook.AssignImageList(self.il)
 		self.notebook.SetPageImage(0, img0)
@@ -97,259 +93,333 @@ class SerialFrame(wx.Frame):
 		vbox.Add(self.toolbar1, 0, wx.EXPAND)
 		vbox.Add(self.notebook, 1, wx.EXPAND)
 		self.SetSizer(vbox)
-
+		
 		self.pageSerial()
 		self.pageConnection()
-		
+		self.read_Serialinst()
+
+		maxi = self.conf.get('GENERAL', 'maximize')
+		if maxi == '1': self.Maximize()
+
 		self.Centre() 
 
 	def ShowStatusBar(self, w_msg, colour):
 		self.GetStatusBar().SetForegroundColour(colour)
 		self.SetStatusText(w_msg)
 
-	# red for error or cancellation messages
 	def ShowStatusBarRED(self, w_msg):
 		self.ShowStatusBar(w_msg, (130,0,0))
 
-	# green for succesful messages
 	def ShowStatusBarGREEN(self, w_msg):
 		self.ShowStatusBar(w_msg, (0,130,0))
 
-	# black for informative messages
 	def ShowStatusBarBLACK(self, w_msg):
 		self.ShowStatusBar(w_msg, wx.BLACK) 
 
-	# yellow for attention messages
 	def ShowStatusBarYELLOW(self, w_msg):
 		self.ShowStatusBar(w_msg,(255,140,0)) 
 
 	def onTabChange(self, event):
 		try:
 			self.SetStatusText('')
-		except:
-			pass
+		except: pass
 
-	# create your page in the manuals and add the link here
 	def OnToolHelp(self, event): 
-		url = "/usr/share/openplotter-doc/template/serial_app.html"
+		url = "/usr/share/openplotter-doc/serial/serial_app.html"
 		webbrowser.open(url, new=2)
 
-	def OnToolSettings(self, event): 
+	def OnToolSettings(self, event=0): 
 		subprocess.call(['pkill', '-f', 'openplotter-settings'])
 		subprocess.Popen('openplotter-settings')
 
-	def OnToolSend(self,e):
-		self.notebook.ChangeSelection(0)
-		if self.toolbar1.GetToolState(103): self.myoption.SetLabel('1')
-		else: self.myoption.SetLabel('0')
+	def onToolRefresh(self,e):
+		self.ShowStatusBarBLACK('')
+		self.read_Serialinst()
 
 	def pageSerial(self):
+		self.imgPorts = wx.ImageList(24, 24)
+		self.imgPorts.Add(wx.Bitmap(self.currentdir+"/data/rpi_port_ll.png", wx.BITMAP_TYPE_PNG))
+		self.imgPorts.Add(wx.Bitmap(self.currentdir+"/data/rpi_port_lr.png", wx.BITMAP_TYPE_PNG))
+		self.imgPorts.Add(wx.Bitmap(self.currentdir+"/data/rpi_port_ul.png", wx.BITMAP_TYPE_PNG))
+		self.imgPorts.Add(wx.Bitmap(self.currentdir+"/data/rpi_port_ur.png", wx.BITMAP_TYPE_PNG))
+		self.imgPorts.Add(wx.Bitmap(self.currentdir+"/data/rpi_port_4ll.png", wx.BITMAP_TYPE_PNG))
+		self.imgPorts.Add(wx.Bitmap(self.currentdir+"/data/rpi_port_4lr.png", wx.BITMAP_TYPE_PNG))
+		self.imgPorts.Add(wx.Bitmap(self.currentdir+"/data/rpi_port_4ul.png", wx.BITMAP_TYPE_PNG))
+		self.imgPorts.Add(wx.Bitmap(self.currentdir+"/data/rpi_port_4ur.png", wx.BITMAP_TYPE_PNG))
+		if self.platform.isRPI:
+			colImages = 130
+			colSerial = 75
+		else:
+			colImages = 30
+			colSerial = 175
 		self.list_Serialinst = wx.ListCtrl(self.p_serial, -1, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.LC_HRULES, size=(-1,200))
-		self.list_Serialinst.InsertColumn(0, _('alias')+' /dev/', width=100)
-		self.list_Serialinst.InsertColumn(1, _('device')+' /dev/', width=100)
-		self.list_Serialinst.InsertColumn(2, _('vendor'), width=60)
-		self.list_Serialinst.InsertColumn(3, _('product'), width=60)
-		self.list_Serialinst.InsertColumn(4, _('serial'), width=120)
-		self.list_Serialinst.InsertColumn(5, _('USB port'), width=120)
-		self.list_Serialinst.InsertColumn(6, _('remember'), width=80)
+		self.list_Serialinst.InsertColumn(0, ' ', width=colImages)
+		self.list_Serialinst.InsertColumn(1, _('USB port'), width=80)
+		self.list_Serialinst.InsertColumn(2, _('device')+' /dev/', width=90)
+		self.list_Serialinst.InsertColumn(3, _('alias')+' /dev/', width=100)
+		self.list_Serialinst.InsertColumn(4, _('vendor'), width=60)
+		self.list_Serialinst.InsertColumn(5, _('product'), width=60)
+		self.list_Serialinst.InsertColumn(6, _('serial'), width=colSerial)
+		self.list_Serialinst.InsertColumn(7, _('remember'), width=80)
 		self.list_Serialinst.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_SerialinstSelected)
 		self.list_Serialinst.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_SerialinstDeselected)
+		self.list_Serialinst.SetImageList(self.imgPorts, wx.IMAGE_LIST_SMALL)
 		
 		ttyOP_label = wx.StaticText(self.p_serial, label='/dev/ttyOP_')
 		name_label = wx.StaticText(self.p_serial, label=_('alias'), size=(100,-1))
 		self.Serial_OPname = wx.TextCtrl(self.p_serial, size=(100,-1))
 	
 		dataLabel = wx.StaticText(self.p_serial, label=_('data'), size=(110,-1))
-		self.serialData = wx.Choice(self.p_serial, choices=['NMEA 0183','NMEA 2000'], style=wx.CB_READONLY, size=(110,-1))
-		self.serialData.Bind(wx.EVT_CHOICE, self.onSelectData)
-
-		assignment_label = wx.StaticText(self.p_serial, label=_('assignment'))
-		self.assign0183 = True
-		self.assignmentN2K = [_('manual')]
-		self.assignment0183 = [_('manual')]
-		#self.assignment0183 = [_('manual'),'GPSD','Signal K > OpenCPN','pypilot > Signal K > OpenCPN','GPSD > pypilot > Signal K > OpenCPN']
-		self.Serial_assignment = wx.Choice(self.p_serial, choices=self.assignment0183, style=wx.CB_READONLY, size=(100,-1))
-		self.Serial_assignment.Bind(wx.EVT_CHOICE, self.onSelectAssigment)
-
-		bauds_label = wx.StaticText(self.p_serial, label=_('bauds'), size=(100,-1))
-		self.bauds = ['4800', '9600', '19200', '38400', '57600', '115200', '230400', '460800', '921600']
-		self.Serial_baud_select = wx.Choice(self.p_serial, choices=self.bauds, style=wx.CB_READONLY, size=(100,-1))
+		self.serialData = wx.Choice(self.p_serial, choices=['NMEA 0183','NMEA 2000', 'Signal K'], style=wx.CB_READONLY, size=(110,-1))
 
 		self.Serial_rem_dev = wx.RadioButton(self.p_serial, label=_('Remember device (by vendor, product, serial)'))
 		self.Serial_rem_port = wx.RadioButton(self.p_serial, label=_('Remember port (positon on the USB-hub)'))
 
-		self.serial_update = wx.Button(self.p_serial, label=_('apply'))
-		self.serial_update.Bind(wx.EVT_BUTTON, self.on_update_Serialinst)
+		self.toolbar2 = wx.ToolBar(self.p_serial, style=wx.TB_TEXT | wx.TB_VERTICAL)
+		self.serial_update = self.toolbar2.AddTool(201, _('Apply'), wx.Bitmap(self.currentdir+"/data/apply.png"))
+		self.Bind(wx.EVT_TOOL, self.on_update_Serialinst, self.serial_update)
+		self.serial_delete = self.toolbar2.AddTool(202, _('Remove'), wx.Bitmap(self.currentdir+"/data/cancel.png"))
+		self.Bind(wx.EVT_TOOL, self.on_delete_Serialinst, self.serial_delete)
 
-		self.serial_delete = wx.Button(self.p_serial, label=_('delete'))
-		self.serial_delete.Bind(wx.EVT_BUTTON, self.on_delete_Serialinst)
-
-		refresh = wx.Button(self.p_serial, label=_('refresh'))
-		refresh.Bind(wx.EVT_BUTTON, self.read_Serialinst)
-		
 		row1labels = wx.BoxSizer(wx.HORIZONTAL)
 		row1labels.Add((0,0), 0, wx.LEFT | wx.EXPAND, 85)
 		row1labels.Add(name_label, 0, wx.LEFT | wx.EXPAND, 5)
 		row1labels.Add(dataLabel, 0, wx.LEFT | wx.EXPAND, 5)
-		row1labels.Add(assignment_label, 1, wx.LEFT | wx.EXPAND, 5)
-		row1labels.Add(bauds_label, 0, wx.LEFT | wx.EXPAND, 5)
 
 		row1 = wx.BoxSizer(wx.HORIZONTAL)
 		row1.Add(ttyOP_label, 0, wx.LEFT | wx.UP | wx.EXPAND, 5)
 		row1.Add(self.Serial_OPname, 0, wx.LEFT | wx.EXPAND, 5)
 		row1.Add(self.serialData, 0, wx.LEFT | wx.EXPAND, 5)
-		row1.Add(self.Serial_assignment, 1, wx.LEFT | wx.EXPAND, 5)
-		row1.Add(self.Serial_baud_select, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 5)
 
 		col1 = wx.BoxSizer(wx.VERTICAL)
+		col1.Add(self.list_Serialinst, 1, wx.ALL | wx.EXPAND, 5)
+		col1.Add(row1labels, 0, wx.ALL | wx.EXPAND, 5)
+		col1.Add(row1, 0, wx.ALL | wx.EXPAND, 5)
 		col1.Add(self.Serial_rem_dev, 0, wx.ALL | wx.EXPAND, 5)
 		col1.Add(self.Serial_rem_port, 0, wx.ALL | wx.EXPAND, 5)
 
-		col2 = wx.BoxSizer(wx.HORIZONTAL)
-		col2.AddStretchSpacer(1)
-		col2.Add(refresh, 0, wx.ALL | wx.EXPAND, 5)
-		col2.Add(self.serial_delete, 0, wx.ALL | wx.EXPAND, 5)
-		col2.Add(self.serial_update, 0, wx.ALL | wx.EXPAND, 5)
-
-		row2 = wx.BoxSizer(wx.HORIZONTAL)
-		row2.Add(col1, 1, wx.ALL | wx.EXPAND, 0)
-		row2.Add(col2, 1, wx.ALL | wx.EXPAND, 0)
-
-		v_final = wx.BoxSizer(wx.VERTICAL)
-		v_final.Add(self.list_Serialinst, 1, wx.EXPAND, 0)
-		v_final.AddSpacer(10)   
-		v_final.Add(row1labels, 0, wx.EXPAND, 0)
-		v_final.AddSpacer(5)
-		v_final.Add(row1, 0, wx.EXPAND, 0)
-		v_final.AddSpacer(10)
-		v_final.Add(row2, 0, wx.EXPAND, 0)
+		v_final = wx.BoxSizer(wx.HORIZONTAL)
+		v_final.Add(col1, 1, wx.EXPAND, 0)
+		v_final.Add(self.toolbar2, 0, wx.EXPAND, 0)
 
 		self.p_serial.SetSizer(v_final)
-				
-		self.read_Serialinst()
-
-	def start_udev(self):
-		subprocess.call(['sudo', 'udevadm', 'control', '--reload-rules'])
-		subprocess.call(['sudo', 'udevadm', 'trigger', '--attr-match=subsystem=tty'])
 
 	def read_Serialinst(self,e=0):	
-		self.toolbar1.DeleteTool(105)
-		self.toolbar1.DeleteTool(106)
-		self.toolbar1.AddTool(105, '', self.emptyimage)
-		self.toolbar1.AddTool(106, '', self.emptyimage)
-
 		self.reset_Serial_fields()
-		self.ShowStatusBarBLACK('')
+		self.onListConnectionsDeselected()
 		self.list_Serialinst.DeleteAllItems()
+		self.listConnections.DeleteAllItems()
+
 		data = self.conf.get('UDEV', 'Serialinst')
 		try:
 			self.Serialinst = eval(data)
 		except:
 			self.Serialinst = {}
-		self.context = pyudev.Context()
 
-		for device in self.context.list_devices(subsystem='tty'):
-			#print(device)
-			i = device.get('DEVNAME')
-			if not '/dev/moitessier' in i:
-				try:
-					ii = device.get('DEVLINKS')
-				except:
-					continue
-			if not ('moitessier' in i or 'ttyACM' in i or 'ttyUSB' in i or 'serial0' in i):
-				continue
+		serialDevices = selectConnections.Serial()
+		for device in serialDevices.devices:
+			devname = device.get('DEVNAME')
 			value = device.get('DEVPATH')
 			port = value[value.rfind('/usb1/') + 6:-(len(value) - value.find('/tty'))]
-			port = port[port.rfind('/') + 1:]
-			try:
-				serial = device.get('ID_SERIAL_SHORT')
-			except:
-				serial = ''
-			try:
-				vendor_db = device.get('ID_VENDOR_FROM_DATABASE')
-			except:
-				vendor_db = ''
-			try:
-				model_db = device.get('ID_MODEL_FROM_DATABASE')
-			except:
-				model_db = ''
-			try:
-				vendor_id = device.get('ID_VENDOR_ID')
-			except:
-				vendor_id = ''
-			try:
-				model_id = device.get('ID_MODEL_ID')
-			except:
-				model_id = ''
-
-			# default values if this port is not configured
+			port = port[port.rfind('/') + 1:]			
+			serial = ''
+			if devname[8:10] == 'SC': serial = devname[10:11]
+			vendor_id = ''
+			model_id = ''
+			for tag in device:
+				if tag == 'ID_SERIAL_SHORT': serial = device.get('ID_SERIAL_SHORT')
+				if tag == 'ID_VENDOR_ID': vendor_id = device.get('ID_VENDOR_ID')
+				if tag == 'ID_MODEL_ID': model_id = device.get('ID_MODEL_ID')
 			name = ''
-			assignment = ''
 			remember = ''
-			bauds = ''
 			serialData = ''
 
 			for n in self.Serialinst:
 				ii = self.Serialinst[n]
-
 				if ii['remember'] == 'port' and ii['port'] == port:
 					if ii['vendor'] != vendor_id or ii['product'] != model_id or str(ii['serial']) != str(serial):
 						self.ShowStatusBarRED(_('Device with vendor ') + vendor_id + ' and product ' + model_id + _(' is connected to a reserved port'))
 						break
 					name = n
-					assignment = ii['assignment']
 					remember = ii['remember']
 					serialData = ii['data']
-					try:
-						bauds = ii['bauds']
-					except: pass
 					break
 				elif ii['remember'] == 'dev' and ii['vendor'] == vendor_id and ii['product'] == model_id and str(ii['serial']) == str(serial):
 					#check if device with same product/vendor/serial has been added
 					exist = False
 					for i2 in range(self.list_Serialinst.GetItemCount()):
-						if n == self.list_Serialinst.GetItemText(i2, 0): exist = True
+						if n == self.list_Serialinst.GetItemText(i2, 3): exist = True
 					if not exist:
 						name = n
-						assignment = ii['assignment']
 						remember = ii['remember']
 						serialData = ''
 						if 'data' in ii:
 							serialData = ii['data']
-						try:
-							bauds = ii['bauds']
-						except: pass
 
-			l = [name, i[5:], vendor_id, model_id, serial, port, remember]
-			self.list_Serialinst.Append(l)
+			l = [port, devname[5:], name, vendor_id, model_id, serial, remember]
+			l2 = [devname[5:], name]
+
+			if devname[8:10] == 'SC':
+				l[5] = devname[10:11]
+				hubtext = ''
+				if l[5] == '2': hubtext = _('upper left') 
+				elif l[5] == '5': hubtext = _('upper right') 
+				elif l[5] == '1': hubtext = _('middle left') 
+				elif l[5] == '4': hubtext = _('middle right') 
+				elif l[5] == '0': hubtext = _('below left') 
+				elif l[5] == '3': hubtext = _('below right') 
+				item = self.list_Serialinst.InsertItem(self.list_Serialinst.GetItemCount(), hubtext)
+			else:
+				#select image
+				if self.platform.isRPI:
+					'''
+					0 /data/rpi_port_ll.png
+					1 /data/rpi_port_lr.png
+					2 /data/rpi_port_ul.png
+					3 /data/rpi_port_ur.png
+					4 /data/rpi_port_4ll.png
+					5 /data/rpi_port_4lr.png
+					6 /data/rpi_port_4ul.png
+					7 /data/rpi_port_4ur.png
+					'''
+					hublen = 9
+					portpos = ''
+					usbport = l[0]
+					hubtext = _('no Hub')
+					image = ''
+					if self.rpitype == '3B':
+						if usbport[4:5] == '2': portpos = 2
+						elif usbport[4:5] == '4': portpos = 3
+						elif usbport[4:5] == '3': portpos = 0
+						elif usbport[4:5] == '5': portpos = 1
+					elif self.rpitype == '3B+':
+						if usbport[4:5] == '1':
+							hublen = 11
+							portpos = 2
+							if usbport[6:7] == '3': portpos = 0
+						elif usbport[4:5] == '2': portpos = 1
+						elif usbport[4:5] == '3': portpos = 3
+					elif self.rpitype == '4B':
+						if usbport[4:5] == '3': portpos = 6
+						elif usbport[4:5] == '1': portpos = 7
+						elif usbport[4:5] == '4': portpos = 4
+						elif usbport[4:5] == '2': portpos = 5
+					
+					if len(usbport) > hublen:
+						portnr = usbport[hublen-3:hublen]
+						if portnr[0:1] in ['1','2','3','4','5','6','7','8']:
+							hubtext = 'Hub port '+portnr
+					if portpos and not 'virtual' in usbport and not 'serial' in usbport: 
+						item = self.list_Serialinst.InsertItem(self.list_Serialinst.GetItemCount(), hubtext, portpos)
+					else: 
+						item = self.list_Serialinst.InsertItem(self.list_Serialinst.GetItemCount(), ' ')
+				else:
+					item = self.list_Serialinst.InsertItem(self.list_Serialinst.GetItemCount(), str(self.list_Serialinst.GetItemCount()+1))
+			if l[0]: self.list_Serialinst.SetItem(item, 1, l[0])
+			if l[1]: self.list_Serialinst.SetItem(item, 2, l[1])
+			if l[2]: self.list_Serialinst.SetItem(item, 3, l[2])
+			if l[3]: self.list_Serialinst.SetItem(item, 4, l[3])
+			if l[4]: self.list_Serialinst.SetItem(item, 5, l[4])
+			if l[5]: self.list_Serialinst.SetItem(item, 6, l[5])
+			if l[6]: self.list_Serialinst.SetItem(item, 7, l[6])
+
+			if l2[1]:
+				item = self.listConnections.InsertItem(self.listConnections.GetItemCount(), l2[0])
+				self.listConnections.SetItem(item, 1, l2[1])
 			
 		for name in self.Serialinst:
+			for iii in range(self.listConnections.GetItemCount()):
+				if name in self.listConnections.GetItemText(iii, 1):
+					if self.Serialinst[name]['data']: 
+						self.listConnections.SetItem(iii, 2, self.Serialinst[name]['data'])
+
 			exist = False
-			for i in range(self.list_Serialinst.GetItemCount()):
-				if name == self.list_Serialinst.GetItemText(i, 0):
+			for iii in range(self.list_Serialinst.GetItemCount()):
+				if name == self.list_Serialinst.GetItemText(iii, 3):
 					if self.Serialinst[name]['data'] == 'NMEA 0183':
-						self.list_Serialinst.SetItemBackgroundColour(i,(102,205,170))
+						self.list_Serialinst.SetItemBackgroundColour(iii,(102,205,170))
 					if self.Serialinst[name]['data'] == 'NMEA 2000':
-						self.list_Serialinst.SetItemBackgroundColour(i,(0,191,255))
+						self.list_Serialinst.SetItemBackgroundColour(iii,(0,191,255))
+					if self.Serialinst[name]['data'] == 'Signal K':
+						self.list_Serialinst.SetItemBackgroundColour(iii,(255,215,0))
 					exist = True
+			#check missing devices
 			if not exist:
-				l = [name, self.Serialinst[name]['device'], self.Serialinst[name]['vendor'], self.Serialinst[name]['product'], self.Serialinst[name]['serial'], self.Serialinst[name]['port'], self.Serialinst[name]['remember']]
+				l = ['', self.Serialinst[name]['port'], self.Serialinst[name]['device'], name, self.Serialinst[name]['vendor'], self.Serialinst[name]['product'], self.Serialinst[name]['serial'], self.Serialinst[name]['remember']]
 				self.list_Serialinst.Append(l)
-				#self.list_Serialinst.Append([x.decode('utf8') for x in l])
 				self.list_Serialinst.SetItemBackgroundColour(self.list_Serialinst.GetItemCount()-1,(255,0,0))
 				self.ShowStatusBarRED(_('There are missing devices'))
 
-	def OnSkConnections(self,e):
-		url = self.platform.http+'localhost:'+self.platform.skPort+'/admin/#/serverConfiguration/connections/-'
-		webbrowser.open(url, new=2)
+		# check existing connections
+		allSerialPorts = serialPorts.SerialPorts()
+		usedSerialPorts = allSerialPorts.getSerialUsedPorts()
+		for i in usedSerialPorts:
+			exists = False
+			for ii in range(self.listConnections.GetItemCount()):
+				if i['device'] == '/dev/'+self.listConnections.GetItemText(ii, 1):
+					if not self.listConnections.GetItemText(ii, 3):
+						if i['data'] == self.listConnections.GetItemText(ii, 2).replace(' ',''):
+							exists = True
+							self.listConnections.SetItem(ii, 3, i['app'])
+							self.listConnections.SetItem(ii, 4, i['id'])
+							self.listConnections.SetItem(ii, 5, str(i['baudrate']))
+			if not exists:
+				if 'ttyOP_' in i['device']:
+					item = self.listConnections.InsertItem(self.listConnections.GetItemCount(), '')
+					self.listConnections.SetItem(item, 1, i['device'].replace('/dev/',''))
+				else:
+					item = self.listConnections.InsertItem(self.listConnections.GetItemCount(), i['device'].replace('/dev/',''))
+				data = ''
+				if i['data'] == 'NMEA0183': data = 'NMEA 0183'
+				if i['data'] == 'NMEA2000': data = 'NMEA 2000'
+				if i['data'] == 'SignalK': data = 'Signal K'
+				self.listConnections.SetItem(item, 2, data)
+				self.listConnections.SetItem(item, 3, i['app'])
+				self.listConnections.SetItem(item, 4, i['id'])
+				self.listConnections.SetItem(item, 5, str(i['baudrate']))
 
-	def OnSkTo0183(self,e):
-		url = self.platform.http+'localhost:'+self.platform.skPort+'/admin/#/serverConfiguration/plugins/sk-to-nmea0183'
-		webbrowser.open(url, new=2)
 
-	def OnSkTo2000(self,e):
-		url = self.platform.http+'localhost:'+self.platform.skPort+'/admin/#/serverConfiguration/plugins/sk-to-nmea2000'
-		webbrowser.open(url, new=2)
+		#setting colours
+		for i in range(self.listConnections.GetItemCount()):
+			enabled = False
+			for iii in usedSerialPorts:
+				if iii['app'] == self.listConnections.GetItemText(i, 3) and iii['id'] == self.listConnections.GetItemText(i, 4): enabled = iii['enabled']
+			if enabled:
+				if self.listConnections.GetItemText(i, 0) and self.listConnections.GetItemText(i, 1) and self.listConnections.GetItemText(i, 3):
+					if self.listConnections.GetItemText(i, 2) == 'NMEA 0183':
+						self.listConnections.SetItemBackgroundColour(i,(102,205,170))
+					elif self.listConnections.GetItemText(i, 2) == 'NMEA 2000':
+						self.listConnections.SetItemBackgroundColour(i,(0,191,255))
+					elif self.listConnections.GetItemText(i, 2) == 'Signal K':
+						self.listConnections.SetItemBackgroundColour(i,(255,215,0))
+			for ii in range(self.listConnections.GetItemCount()):
+				if not self.listConnections.GetItemText(ii, 0) and self.listConnections.GetItemText(ii, 1):
+					self.listConnections.SetItemBackgroundColour(ii,(255,0,0))
+				else:
+					enabled2 = False
+					for iii in usedSerialPorts:
+						if iii['app'] == self.listConnections.GetItemText(ii, 3) and iii['id'] == self.listConnections.GetItemText(ii, 4): enabled2 = iii['enabled']
+					if self.listConnections.GetItemText(i, 0) == self.listConnections.GetItemText(ii, 0) and i != ii and enabled and enabled2:
+						self.listConnections.SetItemBackgroundColour(i,(255,0,0))
+						self.listConnections.SetItemBackgroundColour(ii,(255,0,0))
+					if self.listConnections.GetItemText(i, 1) == self.listConnections.GetItemText(ii, 1) and i != ii and enabled and enabled2:
+						self.listConnections.SetItemBackgroundColour(i,(255,0,0))
+						self.listConnections.SetItemBackgroundColour(ii,(255,0,0))
+
+	def on_delete_Serialinst(self, e):
+		index = self.list_Serialinst.GetNextItem(-1, wx.LIST_NEXT_ALL, wx.LIST_STATE_SELECTED)
+		if index < 0:
+			self.ShowStatusBarYELLOW(_('No device selected'))
+			return
+		name = self.list_Serialinst.GetItemText(index, 3)
+		try:
+			del self.Serialinst[name]
+		except: return
+		self.list_Serialinst.SetItem(index, 3, '')
+		self.list_Serialinst.SetItem(index, 7, '')
+		self.reset_Serial_fields()
+		self.conf.set('UDEV', 'Serialinst', str(self.Serialinst))
+		self.apply_changes_Serialinst()
 
 	def on_SerialinstSelected(self,e):
 		i = e.GetIndex()
@@ -357,64 +427,23 @@ class SerialFrame(wx.Frame):
 		self.reset_Serial_fields()
 		if not valid: return
 
-		hublen = 9
-		portpos = ''
-		usbport = self.list_Serialinst.GetItemText(i, 5)
-		#print(self.rpitype,usbport)
-		if self.rpitype == '3B':
-			if usbport[4:5] == '2': portpos = 'ul'
-			elif usbport[4:5] == '4': portpos = 'ur'
-			elif usbport[4:5] == '3': portpos = 'll'
-			elif usbport[4:5] == '5': portpos = 'lr'
-		elif self.rpitype == '3B+':
-			if usbport[4:5] == '1':
-				hublen = 11
-				portpos = 'ul'
-				if usbport[6:7] == '3': portpos = 'll'
-			elif usbport[4:5] == '2': portpos = 'lr'
-			elif usbport[4:5] == '3': portpos = 'ur'
-		elif self.rpitype == '4B':
-			if usbport[4:5] == '3': portpos = '4ul'
-			elif usbport[4:5] == '1': portpos = '4ur'
-			elif usbport[4:5] == '4': portpos = '4ll'
-			elif usbport[4:5] == '2': portpos = '4lr'
-
-		if portpos != '':
-			#print(self.currentdir+"/data/rpi_port_" + portpos + ".png")
-			self.toolbar1.DeleteTool(105)
-			self.toolbar1.DeleteTool(106)
-			
-			image = wx.Bitmap(self.currentdir+"/data/rpi_port_" + portpos + ".png")
-			self.toolbar1.AddTool(105, 'Raspberry Pi', image)
-			
-			if len(self.list_Serialinst.GetItemText(i, 5)) > hublen:
-				portnr = self.list_Serialinst.GetItemText(i, 5)[hublen-3:hublen]
-				if portnr[0:1] in ['1','2','3','4','5','6','7','8']:
-					image = wx.Bitmap(self.currentdir+"/data/usbhub.png")
-					self.toolbar1.AddTool(106, 'Hub port '+portnr, image)
-			else:
-				self.toolbar1.AddTool(106, '', self.emptyimage)
-				
-		name = self.list_Serialinst.GetItemText(i, 0)
-		if not name: item = {'data':'','assignment':'','bauds':'','port':self.list_Serialinst.GetItemText(i, 5),'remember':''}
-		else: item = self.Serialinst[name]
+		self.toolbar2.EnableTool(201,True)
+		name = self.list_Serialinst.GetItemText(i, 3)
+		if not name: 
+			item = {'data':'','port':self.list_Serialinst.GetItemText(i, 1),'remember':''}
+			self.toolbar2.EnableTool(202,False)
+		else: 
+			item = self.Serialinst[name]
+			self.toolbar2.EnableTool(202,True)
 
 		self.Serial_OPname.Enable()
 		self.serialData.Enable()
-		self.Serial_assignment.Enable()
-		self.serial_update.Enable()
-		self.serial_delete.Enable()
-		self.Serial_baud_select.Enable()
 		self.Serial_rem_dev.Enable()
 		self.Serial_rem_port.Enable()
 
 		self.Serial_OPname.SetValue(name.replace('ttyOP_',''))
 		self.serialData.SetStringSelection(item['data'])
-		self.onSelectData()
-		if item['assignment'] == '0': self.Serial_assignment.SetSelection(0)
-		else: self.Serial_assignment.SetStringSelection(item['assignment'])
-		self.onSelectAssigment()
-		self.Serial_baud_select.SetStringSelection(item['bauds'])
+
 		if 'serial' in item['port'] or 'virtual' in item['port']:
 			self.Serial_rem_port.SetValue(True) # remember by port for non usb
 			self.Serial_rem_port.Disable()
@@ -425,122 +454,39 @@ class SerialFrame(wx.Frame):
 			self.Serial_rem_dev.SetValue(rem == 'dev')
 			self.Serial_rem_port.SetValue(rem == 'port')
 
-	def on_delete_Serialinst(self, e):
-		index = self.list_Serialinst.GetNextItem(-1, wx.LIST_NEXT_ALL, wx.LIST_STATE_SELECTED)
-		if index < 0:
-			self.ShowStatusBarYELLOW(_('No device selected'))
-			return
-		name = self.list_Serialinst.GetItemText(index, 0)
-		try:
-			del self.Serialinst[name]
-		except: return
-		self.list_Serialinst.SetItem(index, 0, '')
-		self.list_Serialinst.SetItem(index, 6, '')
-		self.reset_Serial_fields()
-		self.conf.set('UDEV', 'Serialinst', str(self.Serialinst))
-		self.apply_changes_Serialinst()
-
 	def on_SerialinstDeselected(self,e):
 		self.reset_Serial_fields()
-		self.toolbar1.DeleteTool(105)
-		self.toolbar1.DeleteTool(106)
-		self.toolbar1.AddTool(105, '', self.emptyimage)
-		self.toolbar1.AddTool(106, '', self.emptyimage)
 		
-
 	def reset_Serial_fields(self):
 		self.Serial_OPname.SetValue('')
 		self.serialData.SetSelection(-1)
 		self.Serial_rem_dev.SetValue(True)
 		self.Serial_rem_port.SetValue(False)
-		self.Serial_assignment.SetSelection(-1)
-		self.Serial_baud_select.SetSelection(-1)
 		self.Serial_OPname.Disable()
 		self.serialData.Disable()
-		self.Serial_assignment.Disable()
-		self.serial_update.Disable()
-		self.serial_delete.Disable()
-		self.Serial_baud_select.Disable()
 		self.Serial_rem_dev.Disable()
 		self.Serial_rem_port.Disable()
-		
-	def onSelectData(self, e=0):
-		selected = self.serialData.GetStringSelection()
-		self.Serial_assignment.Clear()
-		self.assign0183 = selected == 'NMEA 0183'
-		if self.assign0183: self.Serial_assignment.AppendItems(self.assignment0183)
-		else: self.Serial_assignment.AppendItems(self.assignmentN2K)
-		self.Serial_baud_select.SetSelection(-1)
-		self.Serial_baud_select.Disable()
+		self.toolbar2.EnableTool(201,False)
+		self.toolbar2.EnableTool(202,False)
 
-	def onSelectAssigment(self, e=0):
-		self.Serial_baud_select.Disable()
-		self.Serial_baud_select.SetSelection(-1)
-		selected = self.Serial_assignment.GetStringSelection()
-		if selected == 'Signal K > OpenCPN': self.Serial_baud_select.Enable()
-
-	def on_enable_UART(self,e):
-		msg = _('This action disables Bluetooth and enables UART. OpenPlotter will reboot.\n')
-		msg += _('Are you sure?')
-		dlg = wx.MessageDialog(None, msg, _('Question'), wx.YES_NO | wx.NO_DEFAULT | wx.ICON_EXCLAMATION)
-		if dlg.ShowModal() == wx.ID_YES: self.edit_boot(True)
+	def onUart(self,e):
+		if self.toolbar1.GetToolState(103):
+			msg = _('This action disables Bluetooth and enables UART interface in GPIO. OpenPlotter will reboot.\n')
+			msg += _('Are you sure?')
+			dlg = wx.MessageDialog(None, msg, _('Question'), wx.YES_NO | wx.NO_DEFAULT | wx.ICON_EXCLAMATION)
+			if dlg.ShowModal() == wx.ID_YES: 
+				subprocess.call([self.platform.admin, 'python3', self.currentdir+'/service.py', 'uartTrue'])
+		else:
+			msg = _('This action disables UART interface in GPIO and enables Bluetooth. OpenPlotter will reboot.\n')
+			msg += _('Are you sure?')
+			dlg = wx.MessageDialog(None, msg, _('Question'), wx.YES_NO | wx.NO_DEFAULT | wx.ICON_EXCLAMATION)
+			if dlg.ShowModal() == wx.ID_YES: 
+				subprocess.call([self.platform.admin, 'python3', self.currentdir+'/service.py', 'uartFalse'])
+		try:
+			subprocess.check_output(['systemctl', 'is-active', 'hciuart']).decode(sys.stdin.encoding)
+			self.toolbar1.ToggleTool(103,False)
+		except: self.toolbar1.ToggleTool(103,True)
 		dlg.Destroy()
-
-	def on_disable_UART(self,e):
-		msg = _('This action disables UART and enables Bluetooth. OpenPlotter will reboot.\n')
-		msg += _('Are you sure?')
-		dlg = wx.MessageDialog(None, msg, _('Question'), wx.YES_NO | wx.NO_DEFAULT | wx.ICON_EXCLAMATION)
-		if dlg.ShowModal() == wx.ID_YES: self.edit_boot(False)
-		dlg.Destroy()
-
-	def edit_boot(self, onoff):
-		file = open('/boot/config.txt', 'r')
-		file1 = open(self.home+'/config.txt', 'w')
-		exists = False
-		while True:
-			line = file.readline()
-			if not line: break
-			if onoff and 'dtoverlay=pi3-disable-bt' in line: 
-				file1.write('dtoverlay=pi3-disable-bt\n')
-				os.system('sudo systemctl disable hciuart')
-				exists = True
-			elif not onoff and 'dtoverlay=pi3-disable-bt' in line: 
-				file1.write('#dtoverlay=pi3-disable-bt\n')
-				os.system('sudo systemctl enable hciuart')
-				exists = True
-			else: file1.write(line)
-		if onoff and not exists: 
-			file1.write('\ndtoverlay=pi3-disable-bt\n')
-			os.system('sudo systemctl disable hciuart')
-		file.close()
-		file1.close()
-
-		file = open('/boot/cmdline.txt', 'r')
-		file1 = open(self.home+'/cmdline.txt', 'w')
-		text = file.read()
-		text = text.replace('\n', '')
-		text_list = text.split(' ')
-		if onoff and 'console=serial0,115200' in text_list: 
-			text_list.remove('console=serial0,115200')
-		if not onoff and not 'console=serial0,115200' in text_list: 
-			text_list.append('console=serial0,115200')
-		final = ' '.join(text_list)+'\n'
-		file1.write(final)
-		file.close()
-		file1.close()
-
-		reset = False
-		if os.system('diff '+self.home+'/config.txt /boot/config.txt > /dev/null'):
-			os.system('sudo mv '+self.home+'/config.txt /boot')
-			reset = True
-		else: os.system('rm -f '+self.home+'/config.txt')
-		if os.system('diff '+self.home+'/cmdline.txt /boot/cmdline.txt > /dev/null'):
-			os.system('sudo mv '+self.home+'/cmdline.txt /boot')
-			reset = True
-		else: os.system('rm -f '+self.home+'/cmdline.txt')
-
-		if reset == True : os.system('sudo shutdown -r now')
-		
 		
 	def on_update_Serialinst(self, e=0):
 
@@ -553,10 +499,10 @@ class SerialFrame(wx.Frame):
 		if not name or not re.match('^[0-9a-z]{1,8}$', name):
 			self.ShowStatusBarYELLOW(_('The alias must be a lowercase string between 1 and 8 characters or numbers.'))
 			return
-		old_name = self.list_Serialinst.GetItemText(index, 0)
+		old_name = self.list_Serialinst.GetItemText(index, 3)
 		name  = 'ttyOP_'+name
 		for i in range(self.list_Serialinst.GetItemCount()):
-			if i != index and name == self.list_Serialinst.GetItemText(i, 0):
+			if i != index and name == self.list_Serialinst.GetItemText(i, 3):
 				self.ShowStatusBarYELLOW(_('Same alias used for multiple devices'))
 				return
 
@@ -565,31 +511,17 @@ class SerialFrame(wx.Frame):
 				self.ShowStatusBarYELLOW(_('Please select type of data'))
 				return
 
-		assignmentIndex = self.Serial_assignment.GetSelection()
-		if assignmentIndex == -1:
-				self.ShowStatusBarYELLOW(_('Please assign the device'))
-				return
-		elif assignmentIndex == 0:
-			assignment = '0'
-		else:
-			assignment = self.Serial_assignment.GetStringSelection()
-
-		bauds = self.Serial_baud_select.GetStringSelection()
-		if assignment == 'Signal K > OpenCPN' and not bauds:
-				self.ShowStatusBarYELLOW(_('Please select bauds'))
-				return
-
 		if self.Serial_rem_dev.GetValue():
 			remember = 'dev'
 		else:
 			remember = 'port'
 
-		device = self.list_Serialinst.GetItemText(index, 1)
-		vendor = self.list_Serialinst.GetItemText(index, 2)
-		product = self.list_Serialinst.GetItemText(index, 3)
-		serial = self.list_Serialinst.GetItemText(index, 4)
-		port = self.list_Serialinst.GetItemText(index, 5)
-		ii = {'device':device, 'vendor':vendor, 'product':product, 'port':port, 'serial':serial, 'assignment':assignment, 'remember':remember, 'bauds':bauds,'data':data}
+		device = self.list_Serialinst.GetItemText(index, 2)
+		vendor = self.list_Serialinst.GetItemText(index, 4)
+		product = self.list_Serialinst.GetItemText(index, 5)
+		serial = self.list_Serialinst.GetItemText(index, 6)
+		port = self.list_Serialinst.GetItemText(index, 1)
+		ii = {'device':device, 'vendor':vendor, 'product':product, 'port':port, 'serial':serial, 'remember':remember,'data':data}
 
 		if old_name and old_name != name: del self.Serialinst[old_name]
 
@@ -613,6 +545,7 @@ class SerialFrame(wx.Frame):
 		self.apply_changes_Serialinst()
 										
 	def apply_changes_Serialinst(self):
+		self.ShowStatusBarYELLOW(_('Applying changes ...'))
 		filename = self.home +'/10-openplotter.rules'
 		if not os.path.isfile(filename):
 			file = open(filename, 'w+')
@@ -620,7 +553,7 @@ class SerialFrame(wx.Frame):
 			file = open(filename, 'w')
 		for name in self.Serialinst:
 			i = self.Serialinst[name]
-			if 'virtual' == i['port']:
+			if 'virtual' == i['port'] or 'SC' == i['device'][3:5]:
 				write_str = 'KERNEL=="'+i['device']
 			elif 'port' == i['remember']: # non-usb serial
 				write_str = 'KERNEL=="' + i['device'] + '*", KERNELS=="' + i['port']
@@ -633,414 +566,440 @@ class SerialFrame(wx.Frame):
 			write_str += '",SYMLINK+="' + name + '"\n'
 			file.write(write_str)
 		file.close()
-		test = 0
-		test = os.system('sudo mv '+self.home +'/10-openplotter.rules /etc/udev/rules.d')
-
-		self.ShowStatusBarYELLOW(_('Applying changes ...'))
-		self.start_udev()
-
-		# write gpsd config
-		if self.gpsd:
-			gpsd_exists = False
-			file = open('/etc/default/gpsd', 'r')
-			file1 = open(self.home+'/gpsd', 'w')
-			while True:
-				line = file.readline()
-				if not line: break
-				if line[:9] == 'DEVICES="':
-					file1.write('DEVICES="')
-					for name in self.Serialinst:
-						if self.Serialinst[name]['assignment'] == 'GPSD' or self.Serialinst[name]['assignment'] == 'GPSD > pypilot > Signal K > OpenCPN':
-							gpsd_exists = True
-							file1.write(name + ' ')
-					file1.write('"\n')
-				else: file1.write(line)
-			file.close()
-			file1.close()
-
-			if os.system('diff '+self.home+'/gpsd /etc/default/gpsd > /dev/null'):
-				os.system('sudo mv '+self.home+'/gpsd /etc/default')
-				os.system('sudo service gpsd restart')
-			else: os.system('rm -f '+self.home+'/gpsd')
-
-		# write pypilot allowed ports
-		if self.pypilot:
-			resetPypilot = False
-			file = open(self.home+'/pypilot_serial_ports', 'w')
-			for name in self.Serialinst:
-				if self.Serialinst[name]['assignment'] == 'pypilot > Signal K > OpenCPN':
-					file.write(name + '\n')
-			file.close()
-			path = self.home + '/.pypilot/serial_ports'
-			if os.system('diff '+self.home+'/pypilot_serial_ports ' + path + ' > /dev/null'):
-				os.system('mv '+self.home+'/pypilot_serial_ports ' + path)
-				resetPypilot = True
-			else: os.system('rm -f '+self.home+'/pypilot_serial_ports')
-
-			checkPypilot = False
-			pypilotMode = self.conf.get('PYPILOT', 'mode')
-			for name in self.Serialinst:
-				if 'pypilot' in self.Serialinst[name]['assignment']: checkPypilot = True
-			if checkPypilot:
-				if pypilotMode != 'basic autopilot':
-					self.conf.set('PYPILOT', 'mode', 'basic autopilot')
-					resetPypilot = True
-			else:
-				if pypilotMode == 'basic autopilot':
-					check_imu = self.check_imu()
-					if check_imu: 
-						imu_data = eval(check_imu) 
-						imu_name = imu_data[0][0]
-						if imu_name != '0': 
-							self.conf.set('PYPILOT', 'mode', 'imu')
-							resetPypilot = True
-						else: 
-							self.conf.set('PYPILOT', 'mode', 'disabled')
-							resetPypilot = True
-					else: 
-						self.conf.set('PYPILOT', 'mode', 'disabled')
-						resetPypilot = True
-
-			if resetPypilot:
-				self.read_pypilot()
-				self.on_apply_changes_pypilot()
-
-		# check kplex interfaces
-		if self.kplex:
-			kplexfile = open(self.home +'/.kplex.conf', 'r', 2000)
-			data = kplexfile.read()
-			kplexfile.close()
-			#split in kplex blocks
-			datas = data.split('[')
-			datanew = ''
-			for ikplex in datas:
-				if ikplex.split(']')[0] == 'serial':
-					exists = False
-					for alias in self.Serialinst:
-						if alias in ikplex and self.Serialinst[alias]['data'] == 'NMEA 0183' and self.Serialinst[alias]['assignment'] == '0': exists = True
-					#if one of the serial settings is equal -> it should stay
-					if exists:
-						datanew += '['+ikplex
-					#if one there is no serial everything should be deleted except comments
-					elif '###' in ikplex:
-						datanew += ikplex[ikplex.find('###'):]
-				else:
-					datanew += '['+ikplex
-
-			#on changes write new conf and restart kplex
-			if datas != datanew:
-				try:
-					kplexfile = open(self.home +'/.kplex.conf', 'w', 2000)
-				except:pass
-				else:
-					kplexfile.write(datanew[1:])
-					kplexfile.close()
-					msg = _('Restarting kplex... ')
-					seconds = 5
-					subprocess.call(['pkill', '-f', 'diagnostic-NMEA.py'])
-					subprocess.call(['pkill', '-f', 'kplex.py'])
-					subprocess.call(['pkill', '-15', 'kplex'])
-					for i in range(seconds, 0, -1):
-						self.ShowStatusBarYELLOW(msg+str(i))
-						time.sleep(1)
-					subprocess.Popen('kplex')
-					self.ShowStatusBarGREEN(_('Kplex restarted'))
-			
-		# check SK devices
-		if self.SK:
-			if self.SK_settings.setSKsettings(): self.restart_SK(0)
-			else: time.sleep(1)
-
+		subprocess.call([self.platform.admin, 'python3', self.currentdir+'/service.py', 'udev', self.home+'/10-openplotter.rules'])
 		self.read_Serialinst()
-		#self.read_n2k()
-
-		# check connections
-		exists = False
-		for alias in self.Serialinst:
-			if self.Serialinst[alias]['data'] == 'NMEA 2000' and self.Serialinst[alias]['assignment'] == 'Signal K > OpenCPN':
-				exists = True
-		if exists:
-			wx.MessageBox(_('You have assigned one or more N2K devices to Signal K > OpenCPN.\n\nThey are ready to send data to Signal K but if you want OpenCPN to get data from Signal K you need to use the Signal K plugins "SK to NMEA 0183" and "N2K AIS to NMEA0183".\n\nYour devices are also ready to send data from Signal K to your N2K network. Use the Signal K plugin "SK to N2K" and allow PGNs transmission using the "Open TX PGNs" tool.\n\n Go to "CAN" tab to access plugins and settings.'), 'Warning', wx.OK | wx.ICON_WARNING)
-
-		checkOpencpn = False
-		for alias in self.Serialinst:
-			assignment = self.Serialinst[alias]['assignment'] 
-			if 'OpenCPN' in assignment: checkOpencpn = True
-		if checkOpencpn:
-			Osettings = opencpnSettings()
-			opencpnConnection = Osettings.getConnectionState()
-			if not opencpnConnection:
-				wx.MessageBox(_('The default OpenCPN connection is missing and it is not getting data from Signal K. Please create this connection in OpenCPN:\n\nNetwork\nProtocol: TCP\nAddress: localhost\nData Port: 10110'), 'Warning', wx.OK | wx.ICON_WARNING)
-			elif opencpnConnection == 'disabled': 
-				wx.MessageBox(_('The default OpenCPN connection is disabled and it is not getting data from Signal K. Please enable this connection in OpenCPN:\n\nNetwork\nProtocol: TCP\nAddress: localhost\nData Port: 10110'), 'Warning', wx.OK | wx.ICON_WARNING)
+		self.ShowStatusBarGREEN(_('Applied changes'))
 
 	def OnRemoveButton(self, e):
 		index = self.list_Serialinst.GetNextItem(-1, wx.LIST_NEXT_ALL, wx.LIST_STATE_SELECTED)
 		if index < 0:
 			self.ShowStatusBarYELLOW(_('No device selected'))
 			return
-		name = self.list_Serialinst.GetItemText(index, 0)
+		name = self.list_Serialinst.GetItemText(index, 3)
 		try:
 			del self.Serialinst[name]
 		except: return
-		self.list_Serialinst.SetItem(index, 0, '')
-		self.list_Serialinst.SetItem(index, 6, '')
+		self.list_Serialinst.SetItem(index, 3, '')
+		self.list_Serialinst.SetItem(index, 7, '')
 		self.reset_Serial_fields()
 		self.conf.set('UDEV', 'Serialinst', str(self.Serialinst))
-		self.apply_changes_Serialinst()
-		
+		self.apply_changes_Serialinst()	
 
 	def pageConnection(self):
 		self.toolbar3 = wx.ToolBar(self.connections, style=wx.TB_TEXT)
-		skConnections = self.toolbar3.AddTool(302, _('SK Connection'), wx.Bitmap(self.currentdir+"/data/sk.png"))
+		skConnections = self.toolbar3.AddTool(301, _('Add to Signal K'), wx.Bitmap(self.currentdir+"/data/sk.png"))
 		self.Bind(wx.EVT_TOOL, self.OnSkConnections, skConnections)
-		self.toolbar3.AddSeparator()
-		skTo0183 = self.toolbar3.AddTool(303, 'SK → NMEA 0183', wx.Bitmap(self.currentdir+"/data/sk.png"))
-		self.Bind(wx.EVT_TOOL, self.OnSkTo0183, skTo0183)
-		skTo2000 = self.toolbar3.AddTool(304, 'SK → NMEA 2000', wx.Bitmap(self.currentdir+"/data/sk.png"))
-		self.Bind(wx.EVT_TOOL, self.OnSkTo2000, skTo2000)
+		canConnections = self.toolbar3.AddTool(302, _('Add to CAN Bus'), wx.Bitmap(self.currentdir+"/data/can.png"))
+		self.Bind(wx.EVT_TOOL, self.OnCanConnections, canConnections)
+		gpsdConnections = self.toolbar3.AddTool(303, _('Add to GPSD'), wx.Bitmap(self.currentdir+"/data/gpsd.png"))
+		self.Bind(wx.EVT_TOOL, self.OnGpsdConnections, gpsdConnections)
+		pypilotConnections = self.toolbar3.AddTool(304, _('Add to Pypilot'), wx.Bitmap(self.currentdir+"/data/pypilot.png"))
+		self.Bind(wx.EVT_TOOL, self.OnPypilotConnections, pypilotConnections)
+		kplexConnections = self.toolbar3.AddTool(305, _('Add to Kplex'), wx.Bitmap(self.currentdir+"/data/kplex.png"))
+		self.Bind(wx.EVT_TOOL, self.OnKplexConnections, kplexConnections)
 
-		enableUART = wx.Button(self.connections, label=_('enable UART'))
-		enableUART.Bind(wx.EVT_BUTTON, self.on_enable_UART)
+		self.listConnections = wx.ListCtrl(self.connections, -1, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.LC_HRULES, size=(-1,200))
+		self.listConnections.InsertColumn(0, _('device')+' /dev/', width=120)
+		self.listConnections.InsertColumn(1, _('alias')+' /dev/', width=120)
+		self.listConnections.InsertColumn(2, _('data'), width=100)
+		self.listConnections.InsertColumn(3, _('connection'), width=100)
+		self.listConnections.InsertColumn(4, _('ID'), width=120)
+		self.listConnections.InsertColumn(5, _('bauds'), width=100)
+		self.listConnections.Bind(wx.EVT_LIST_ITEM_SELECTED, self.onListConnectionsSelected)
+		self.listConnections.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.onListConnectionsDeselected)
 
-		disableUART = wx.Button(self.connections, label=_('disable UART'))
-		disableUART.Bind(wx.EVT_BUTTON, self.on_disable_UART)
-		
-		self.SK_activ = wx.CheckBox(self.connections, label=_('setup serial port in Signal K (not recommended)'))
-		self.SK_activ.Bind(wx.EVT_CHECKBOX, self.on_SK_activ)
+		self.toolbar4 = wx.ToolBar(self.connections, style=wx.TB_TEXT | wx.TB_VERTICAL)
+		editConnection = self.toolbar4.AddTool(401, _('Edit'), wx.Bitmap(self.currentdir+"/data/edit.png"))
+		self.Bind(wx.EVT_TOOL, self.OnEditConnection, editConnection)
+		removeConnection = self.toolbar4.AddTool(402, _('Remove'), wx.Bitmap(self.currentdir+"/data/cancel.png"))
+		self.Bind(wx.EVT_TOOL, self.OnRemoveConnection, removeConnection)
 
-		self.gpsd_activ = wx.CheckBox(self.connections, label=_('setup serial port in gpsd (not recommended)'))
-		self.gpsd_activ.Bind(wx.EVT_CHECKBOX, self.on_gpsd_activ)
+		hbox = wx.BoxSizer(wx.HORIZONTAL)
+		hbox.Add(self.listConnections, 1, wx.ALL | wx.EXPAND, 5)
+		hbox.Add(self.toolbar4, 0,  wx.EXPAND, 0)
 
-		self.pypilot_activ = wx.CheckBox(self.connections, label=_('setup serial port in pypilot (not recommended)'))
-		self.pypilot_activ.Bind(wx.EVT_CHECKBOX, self.on_pypilot_activ)
-
-		row2 = wx.BoxSizer(wx.HORIZONTAL)
-		row2.AddStretchSpacer(1)
-		row2.Add(enableUART, 0, wx.ALL | wx.EXPAND, 5)
-		row2.Add(disableUART, 0, wx.ALL | wx.EXPAND, 5)
-		
 		vbox = wx.BoxSizer(wx.VERTICAL)
-		vbox.Add(self.toolbar3, 0, wx.LEFT | wx.EXPAND, 0)
-		vbox.Add(row2, 0, wx.LEFT | wx.EXPAND, 0)
-		vbox.Add(self.SK_activ, 0, wx.LEFT | wx.EXPAND, 0)
-		vbox.Add(self.gpsd_activ, 0, wx.LEFT | wx.EXPAND, 0)
-		vbox.Add(self.pypilot_activ, 0, wx.LEFT | wx.EXPAND, 0)
-		vbox.AddStretchSpacer(1)
-		self.connections.SetSizer(vbox)	
-		self.printConnections()
-		
-	def printConnections(self):
-		# Check if Signal K and some plugins are installed
-		if self.platform.skPort: 
-			self.toolbar3.EnableTool(302,True)
-			self.toolbar3.EnableTool(303,True)
-			if self.platform.isSKpluginInstalled('signalk-to-nmea2000'):
+		vbox.Add(self.toolbar3, 0, wx.EXPAND, 0)
+		vbox.Add(hbox, 1, wx.EXPAND, 0)
+
+		self.connections.SetSizer(vbox)
+
+	def onListConnectionsSelected(self, e):
+		i = e.GetIndex()
+		valid = e and i >= 0
+		self.onListConnectionsDeselected()
+		if not valid: return
+
+		connection = self.listConnections.GetItemText(i, 3)
+		if not connection:
+			data = self.listConnections.GetItemText(i, 2)
+			if data == 'NMEA 0183':
+				self.toolbar3.EnableTool(301,True)
+				self.toolbar3.EnableTool(303,True)
 				self.toolbar3.EnableTool(304,True)
-			else: self.toolbar3.EnableTool(304,False)
+				self.toolbar3.EnableTool(305,True)
+			elif data == 'NMEA 2000':
+				self.toolbar3.EnableTool(302,True)
+			elif data == 'Signal K':
+				self.toolbar3.EnableTool(301,True)
 		else:
-			self.toolbar3.EnableTool(302,False)
-			self.toolbar3.EnableTool(303,False)
-			self.toolbar3.EnableTool(304,False)
-		
-	def on_SK_activ(self, e):
-		if self.SK_activ.GetValue():
-			if not ('Signal K > OpenCPN' in self.assignment0183):
-				self.assignment0183.append('Signal K > OpenCPN')
-				self.assignmentN2K.append('Signal K > OpenCPN')
+			if connection == 'GPSD': self.toolbar4.EnableTool(401,False)
+			else: self.toolbar4.EnableTool(401,True)
+			self.toolbar4.EnableTool(402,True)
 
-				self.Serial_assignment.Clear()
-				if self.assign0183: self.Serial_assignment.AppendItems(self.assignment0183)
-				else: self.Serial_assignment.AppendItems(self.assignmentN2K)
+	def onListConnectionsDeselected(self, e=0):
+		self.toolbar3.EnableTool(301,False)
+		self.toolbar3.EnableTool(302,False)
+		self.toolbar3.EnableTool(303,False)
+		self.toolbar3.EnableTool(304,False)
+		self.toolbar3.EnableTool(305,False)
+		self.toolbar4.EnableTool(401,False)
+		self.toolbar4.EnableTool(402,False)
+
+	def OnSkConnections(self,e):
+		selected = self.listConnections.GetFirstSelected()
+		if selected == -1: return
+		if self.platform.skPort: 
+			app = 'SK'
+			device = self.listConnections.GetItemText(selected, 0)
+			alias = self.listConnections.GetItemText(selected, 1)
+			data = self.listConnections.GetItemText(selected, 2)
+			dlg = addConnection(app,device,alias,data)
+			res = dlg.ShowModal()
+			if res == wx.ID_SETUP:
+				url = self.platform.http+'localhost:'+self.platform.skPort+'/admin/#/serverConfiguration/connections/-'
+				webbrowser.open(url, new=2)
+			elif res == wx.ID_OK:
+				if dlg.error: self.ShowStatusBarRED(dlg.error)
+				else: 
+					if dlg.restart: 
+						self.restart_SK(0)
+			dlg.Destroy()
+		else: 
+			self.ShowStatusBarRED(_('Please install "Signal K Installer" OpenPlotter app'))
+			self.OnToolSettings()
+
+	def OnCanConnections(self,e):
+		selected = self.listConnections.GetFirstSelected()
+		if selected == -1: return
+		if self.platform.isInstalled('openplotter-can'):
+			if self.platform.skPort: 
+				app = 'CAN'
+				device = self.listConnections.GetItemText(selected, 0)
+				alias = self.listConnections.GetItemText(selected, 1)
+				data = self.listConnections.GetItemText(selected, 2)
+				dlg = addConnection(app,device,alias,data)
+				res = dlg.ShowModal()
+				if res == wx.ID_SETUP:
+					subprocess.call(['pkill', '-f', 'openplotter-can'])
+					subprocess.Popen(['openplotter-can', 'canable'])
+				elif res == wx.ID_OK:
+					if dlg.error: self.ShowStatusBarRED(dlg.error)
+					else: 
+						if dlg.restart: 
+							self.restart_SK(0)
+				dlg.Destroy()
+			else: 
+				self.ShowStatusBarRED(_('Please install "Signal K Installer" OpenPlotter app'))
+				self.OnToolSettings()
 		else:
-			if 'Signal K > OpenCPN' in self.assignment0183:
-				self.assignment0183.remove('Signal K > OpenCPN')
-				self.assignmentN2K.remove('Signal K > OpenCPN')
-				
-				self.Serial_assignment.Clear()
-				if self.assign0183: self.Serial_assignment.AppendItems(self.assignment0183)
-				else: self.Serial_assignment.AppendItems(self.assignmentN2K)
-	
-	def on_gpsd_activ(self, e):
-		if self.gpsd_activ.GetValue():
-			if not ('GPSD' in self.assignment0183):
-				self.assignment0183.append('GPSD')
+			self.ShowStatusBarRED(_('Please install "CAN Bus" OpenPlotter app'))
+			self.OnToolSettings()
 
-				self.Serial_assignment.Clear()
-				if self.assign0183: self.Serial_assignment.AppendItems(self.assignment0183)
+	def OnGpsdConnections(self,e):
+		selected = self.listConnections.GetFirstSelected()
+		if selected == -1: return
+		if self.platform.isInstalled('gpsd'):
+			app = 'gpsd'
+			device = self.listConnections.GetItemText(selected, 0)
+			alias = self.listConnections.GetItemText(selected, 1)
+			data = self.listConnections.GetItemText(selected, 2)
+			dlg = addConnection(app,device,alias,data)
+			res = dlg.ShowModal()
+			if res == wx.ID_OK:
+				if dlg.error: self.ShowStatusBarRED(dlg.error)
+				else: 
+					self.ShowStatusBarGREEN(_('GPSD config file modified'))
+					self.read_Serialinst()
+			dlg.Destroy()
 		else:
-			if 'GPSD' in self.assignment0183:
-				self.assignment0183.remove('GPSD')
+			self.ShowStatusBarRED(_('Please install "gpsd" package'))
 
-				self.Serial_assignment.Clear()
-				if self.assign0183: self.Serial_assignment.AppendItems(self.assignment0183)
 
-	def on_pypilot_activ(self, e):
-		if self.pypilot_activ.GetValue():
-			if not ('pypilot > Signal K > OpenCPN' in self.assignment0183):
-				self.assignment0183.append('pypilot > Signal K > OpenCPN')
-				if self.gpsd_activ.GetValue(): self.assignment0183.append('GPSD > pypilot > Signal K > OpenCPN')
-
-				self.Serial_assignment.Clear()
-				if self.assign0183: self.Serial_assignment.AppendItems(self.assignment0183)
+	def OnPypilotConnections(self,e):
+		selected = self.listConnections.GetFirstSelected()
+		if selected == -1: return
+		if self.platform.isInstalled('openplotter-pypilot'):
+			app = 'pypilot'
+			device = self.listConnections.GetItemText(selected, 0)
+			alias = self.listConnections.GetItemText(selected, 1)
+			data = self.listConnections.GetItemText(selected, 2)
+			dlg = addConnection(app,device,alias,data)
+			res = dlg.ShowModal()
+			if res == wx.ID_SETUP:
+				subprocess.call(['pkill', '-f', 'openplotter-pypilot'])
+				subprocess.Popen(['openplotter-pypilot'])
+			elif res == wx.ID_OK:
+				if dlg.error: self.ShowStatusBarRED(dlg.error)
+				else:
+					self.ShowStatusBarYELLOW(_('Applying changes ...'))
+					subprocess.call([self.platform.admin, 'python3', self.currentdir+'/service.py', 'pypilot'])
+					self.ShowStatusBarGREEN(_('Pypilot serial devices modified and autopilot enabled'))
+					self.read_Serialinst()
+			dlg.Destroy()
 		else:
-			if 'pypilot > Signal K > OpenCPN' in self.assignment0183:
-				self.assignment0183.remove('pypilot > Signal K > OpenCPN')
-				if 'GPSD > pypilot > Signal K > OpenCPN' in self.assignment0183:
-					self.assignment0183.remove('GPSD > pypilot > Signal K > OpenCPN')
+			self.ShowStatusBarRED(_('Please install "Pypilot" OpenPlotter app'))
+			self.OnToolSettings()
 
-				self.Serial_assignment.Clear()
-				if self.assign0183: self.Serial_assignment.AppendItems(self.assignment0183)
+	def OnKplexConnections(self,e):
+		selected = self.listConnections.GetFirstSelected()
+		if selected == -1: return
+		if self.platform.isInstalled('openplotter-kplex'):
+			app = 'kplex'
+			device = self.listConnections.GetItemText(selected, 0)
+			alias = self.listConnections.GetItemText(selected, 1)
+			data = self.listConnections.GetItemText(selected, 2)
+			dlg = addConnection(app,device,alias,data)
+			res = dlg.ShowModal()
+			if res == wx.ID_SETUP:
+				pass
+				#subprocess.call(['pkill', '-f', 'openplotter-kplex'])
+				#subprocess.Popen(['openplotter-kplex'])
+			elif res == wx.ID_OK:
+				if dlg.error: self.ShowStatusBarRED(dlg.error)
+				else: pass
+			dlg.Destroy()
+		else:
+			self.ShowStatusBarRED(_('Please install "Kplex" OpenPlotter app'))
+			self.OnToolSettings()
 
-################################################################################
+	def OnEditConnection(self, e):
+		selected = self.listConnections.GetFirstSelected()
+		if selected == -1: return
+		connection = self.listConnections.GetItemText(selected, 3)
+		ID = self.listConnections.GetItemText(selected, 4)
+		if connection == 'Signal K':
+			if ID:
+				url = self.platform.http+'localhost:'+self.platform.skPort+'/admin/#/serverConfiguration/connections/'+ID
+				webbrowser.open(url, new=2)
+		elif connection == 'CAN Bus':
+			subprocess.call(['pkill', '-f', 'openplotter-can'])
+			subprocess.Popen(['openplotter-can', 'canable'])
+		elif connection == 'OpenCPN':
+			subprocess.call(['pkill', '-f', 'opencpn'])
+			subprocess.Popen(['opencpn'])
+		elif connection == 'Pypilot':
+			subprocess.call(['pkill', '-f', 'openplotter-pypilot'])
+			subprocess.Popen(['openplotter-pypilot'])
 
-	def start_SK(self):
-		subprocess.call(['sudo', 'systemctl', 'start', 'signalk.socket'])
-		subprocess.call(['sudo', 'systemctl', 'start', 'signalk.service'])
-
-	def stop_SK(self):
-		subprocess.call(['sudo', 'systemctl', 'stop', 'signalk.service'])
-		subprocess.call(['sudo', 'systemctl', 'stop', 'signalk.socket'])
-		
+	def OnRemoveConnection(self, e):
+		selected = self.listConnections.GetFirstSelected()
+		if selected == -1: return
+		connection = self.listConnections.GetItemText(selected, 3)
+		ID = self.listConnections.GetItemText(selected, 4)
+		if connection == 'Signal K':
+			from openplotterSignalkInstaller import editSettings
+			skSettings = editSettings.EditSettings()
+			if ID: 
+				if skSettings.removeConnection(ID): self.restart_SK(0)
+				else: self.ShowStatusBarRED(_('Failed. Error removing connection in Signal K'))
+		elif connection == 'CAN Bus':
+			subprocess.call(['pkill', '-f', 'openplotter-can'])
+			subprocess.Popen(['openplotter-can', 'canable'])
+		elif connection == 'GPSD':
+			subprocess.call([self.platform.admin, 'python3', self.currentdir+'/editGpsd.py', 'remove', ID])
+			self.read_Serialinst()
+		elif connection == 'OpenCPN':
+			subprocess.call(['pkill', '-f', 'opencpn'])
+			subprocess.Popen(['opencpn'])
+		elif connection == 'Pypilot':
+			subprocess.call(['pkill', '-f', 'openplotter-pypilot'])
+			subprocess.Popen(['openplotter-pypilot'])
+			
 	def restart_SK(self, msg):
 		if msg == 0: msg = _('Restarting Signal K server... ')
 		seconds = 12
-		self.stop_SK()
-		self.start_SK()
+		subprocess.call([self.platform.admin, 'python3', self.currentdir+'/service.py', 'restart'])
 		for i in range(seconds, 0, -1):
 			self.ShowStatusBarYELLOW(msg+str(i))
 			time.sleep(1)
 		self.ShowStatusBarGREEN(_('Signal K server restarted'))
-		
-################################################################################
-		
-class opencpnSettings:
-
-	def __init__(self):
-
-		home = os.path.expanduser("~")
-		self.confFile = home+'/.opencpn/opencpn.conf'
-		self.installed_openocpn = os.path.exists(self.confFile)			
-
-		if self.installed_openocpn:
-			self.confData = configparser.ConfigParser()
-
-	def getConnectionState(self):
-		if self.installed_openocpn:
-			result = False
-			self.confData.read(self.confFile)
-			tmp = self.confData.get('Settings/NMEADataSource', 'DataConnections')
-			connections = tmp.split('|')
-			for connection in connections:
-				#0;1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18
-				#serial/network;TCP/UDP/GPSD;address;port;?;serialport;bauds;?;0=input/1=input+output/2=output;?;?;?;?;?;?;?;?;enabled/disabled;comments
-				items = connection.split(';')
-				if items[0] == '1':
-					if items[1] == '0':
-						if items[2] == 'localhost':
-							if items[3] == '10110':
-								if items[8] == '0' or items[8] == '1':
-									if items[17] == '1': result = 'enabled'
-									else: result = 'disabled'
-			return result
-		return True
+		self.read_Serialinst()
 
 ################################################################################
 
-class SK_settings:
+class addConnection(wx.Dialog):
+	def __init__(self, app, device, alias, data):
+		self.conf = conf.Conf()
+		self.platform = platform.Platform()
+		self.currentdir = os.path.dirname(__file__)
+		self.ID = alias.replace("ttyOP_", "")
+		self.device = '/dev/'+device
+		self.alias = '/dev/'+alias
+		self.data = data
+		self.app = app
+		title = _('Adding connection for device: ')+alias
+		wx.Dialog.__init__(self, None, title=title, size=(500, 444))
+		panel = wx.Panel(self)
 
-	def __init__(self, conf):
-		self.installed = False
-		self.conf = conf
-		self.home = os.path.expanduser("~")
-		self.setting_file = self.home+'/.signalk/settings.json'
-		self.load()
+		msg1Label = wx.StaticText(panel,-1, style = wx.ALIGN_LEFT) 
 
-	def load(self):
-		if os.path.exists(self.setting_file):
-			with open(self.setting_file) as data_file:
-				self.data = ujson.load(data_file)
-			self.installed = True			
-		else:
-			self.data = {}
+		baudsList = ['4800', '9600', '19200', '38400', '57600', '115200', '230400', '460800', '921600']
+		baudsLabel = wx.StaticText(panel, label=_('Baud Rate: '))
+		self.bauds = wx.ComboBox(panel, choices=baudsList)
+		
+		msg2Label = rt.RichTextCtrl(panel, style=wx.TE_MULTILINE|wx.TE_READONLY|wx.TE_DONTWRAP|wx.LC_SORT_ASCENDING)
+		msg2Label.SetMargins((10,10))
 
-	def setSKsettings(self):
-		write = False
-		serialInst = self.conf.get('UDEV', 'Serialinst')
-		try: serialInst = eval(serialInst)
-		except: serialInst = {}
-		#serial NMEA 0183 devices
-		for alias in serialInst:
-			if serialInst[alias]['data'] == 'NMEA 0183' and serialInst[alias]['assignment'] == 'Signal K > OpenCPN':
+		cancelBtn = wx.Button(panel, wx.ID_CANCEL)
+		setupBtn = wx.Button(panel, wx.ID_SETUP, label=_('MANUAL'))
+		setupBtn.Bind(wx.EVT_BUTTON, self.setup)
+		okBtn = wx.Button(panel, wx.ID_OK, label=_('AUTO'))
+		okBtn.Bind(wx.EVT_BUTTON, self.ok)
+
+		if self.app == 'SK':
+			msg1 = _('Data: ')+self.data+'\n'
+			msg1 += _('ID: ')+self.ID+'\n'
+			msg1 += _('Serial port: ')+self.alias
+			self.bauds.SetSelection(3)
+			msg2Label.WriteText(_('Press AUTO to create a connection in Signal K using the settings above.'))
+			msg2Label.Newline()
+			msg2Label.Newline()
+			msg2Label.WriteText(_('Signal K will send data to OpenCPN, be sure a network TCP localhost:10110 input connection exists in OpenCPN.'))
+			msg2Label.Newline()
+			msg2Label.Newline()
+			msg2Label.WriteText(_('Press MANUAL if you need to add special settings.'))
+		elif self.app == 'CAN':
+			msg1 = _('Data: ')+self.data+'\n'
+			msg1 += _('ID: ')+self.ID+'\n'
+			msg1 += _('Serial port: ')+self.alias
+			self.bauds.SetSelection(5)
+			msg2Label.WriteText(_('Press AUTO to create a "canboatjs" connection for a NGT-1 or a CAN-USB device in Signal K using the settings above.'))
+			msg2Label.Newline()
+			msg2Label.Newline()
+			msg2Label.WriteText(_('Use the "SK → NMEA 0183" plugin to send data to OpenCPN, be sure a network TCP localhost:10110 input connection exists in OpenCPN.'))
+			msg2Label.Newline()
+			msg2Label.Newline()
+			msg2Label.WriteText(_('Use "SK → NMEA 2000" plugin to send data from Signal K to your CAN network. Open desired TX PGNs in your device.'))
+			msg2Label.Newline()
+			msg2Label.Newline()
+			msg2Label.WriteText(_('Press MANUAL if you need to add special settings or you want to set a CANable device.'))
+		elif self.app == 'gpsd':
+			msg1 = _('Data: ')+self.data+'\n'
+			msg1 += _('Serial port: ')+self.alias
+			self.bauds.Disable()
+			baudsLabel.Disable()
+			setupBtn.Disable()
+			msg2Label.WriteText(_('Press AUTO to add this device to the list of devices managed by GPSD.'))
+			msg2Label.Newline()
+			msg2Label.Newline()
+			msg2Label.WriteText(_('Be sure you send only GNSS or AIS data to GPSD. Baud Rate will be automatically assigned.'))
+			msg2Label.Newline()
+			msg2Label.Newline()
+			msg2Label.WriteText(_('Pypilot will get data from GPSD automatically.'))
+		elif self.app == 'pypilot':
+			msg1 = _('Data: ')+self.data+' '+ _('(or motor controller data)') +'\n'
+			msg1 += _('Serial port: ')+self.alias
+			self.bauds.Disable()
+			baudsLabel.Disable()
+			msg2Label.WriteText(_('Press AUTO to use this device to send data to Pypilot. Baud Rate will be automatically assigned.'))
+			msg2Label.Newline()
+			msg2Label.Newline()
+			msg2Label.WriteText(_('You can also set the motor controller in this way, but make sure you have enabled UART before.'))
+			msg2Label.Newline()
+			msg2Label.Newline()
+			msg2Label.WriteText(_('Press MANUAL if you prefer to set this device in openplotter-pypilot app.'))
+		elif self.app == 'kplex':
+			msg1 = _('Data: ')+'\n'
+			msg1 += _('ID: ')+'\n'
+			msg1 += _('Serial port: ')
+			self.bauds.Disable()
+			baudsLabel.Disable()
+			msg2Label.WriteText(_('Coming soon.'))
+
+		msg1Label.SetLabel(msg1)
+
+		hbox3 = wx.BoxSizer(wx.HORIZONTAL)
+		hbox3.Add(baudsLabel, 0, wx.RIGHT | wx.LEFT | wx.EXPAND, 10)
+		hbox3.Add(self.bauds, 1, wx.RIGHT | wx.LEFT | wx.EXPAND, 10)
+
+		hbox = wx.BoxSizer(wx.HORIZONTAL)
+		hbox.AddStretchSpacer(1)
+		hbox.Add(cancelBtn, 0, wx.EXPAND, 0)
+		hbox.Add(setupBtn, 0, wx.LEFT | wx.EXPAND, 10)
+		hbox.Add(okBtn, 0, wx.LEFT | wx.EXPAND, 10)
+
+		vbox = wx.BoxSizer(wx.VERTICAL)
+		vbox.AddSpacer(5)
+		vbox.Add(msg1Label, 0, wx.RIGHT | wx.LEFT | wx.EXPAND, 15)
+		vbox.Add(hbox3, 0, wx.RIGHT | wx.LEFT | wx.EXPAND, 5)
+		vbox.AddSpacer(5)
+		vbox.Add(msg2Label, 1, wx.RIGHT | wx.LEFT | wx.EXPAND, 15)
+		vbox.Add(hbox, 0, wx.ALL | wx.EXPAND, 10)
+
+		panel.SetSizer(vbox)
+		self.panel = panel
+		self.Centre() 
+
+	def setup(self,e):
+		self.EndModal(wx.ID_SETUP)
+
+	def ok(self,e):
+		self.restart = False
+		self.error = False
+		allSerialPorts = serialPorts.SerialPorts()
+		usedSerialPorts = allSerialPorts.getSerialUsedPorts()
+		for i in usedSerialPorts:
+			if i['id'] == self.ID: self.error = _('Failed. This ID already exists')
+			if i['device'] == self.device or i['device'] == self.alias: self.error = _('Failed. This device is already in use')
+		if not self.error:
+			if self.app == 'SK' or self.app == 'CAN':
+				from openplotterSignalkInstaller import editSettings
+				skSettings = editSettings.EditSettings()
+				c = 0
+				while True:
+					if skSettings.connectionIdExists(self.ID):
+						self.ID = self.ID+str(c)
+						c = c + 1
+					else: break
+				if skSettings.setSerialConnection(self.ID, self.data, self.alias, self.bauds.GetValue()): self.restart = True
+				else: self.error = _('Failed. Error creating connection in Signal K')
+			elif self.app == 'gpsd':
+				subprocess.call([self.platform.admin, 'python3', self.currentdir+'/editGpsd.py', 'add', self.alias])
+			elif self.app == 'pypilot':
 				exists = False
-				if 'pipedProviders' in self.data:
-					count = 0
-					for i in self.data['pipedProviders']:
-						if i['id'] == alias:
-							exists = True
-							if i['pipeElements'][0]['options']['subOptions']['baudrate'] != int(serialInst[alias]['bauds']):
-								write = True
-								self.data['pipedProviders'][count]['pipeElements'][0]['options']['subOptions']['baudrate'] = int(serialInst[alias]['bauds'])
-						count = count + 1
-				if not exists:
-					self.data['pipedProviders'].append({'pipeElements': [{'type': 'providers/simple', 'options': {'logging': False, 'type': 'NMEA0183', 'subOptions': {"validateChecksum": True, "type": "serial", "device": '/dev/'+alias, "baudrate": int(serialInst[alias]['bauds'])}}}], 'enabled': True, 'id': alias})
-					write = True
-		count = 0
-		for i in self.data['pipedProviders']:
-			if 'ttyOP_' in i['id'] and i['pipeElements'][0]['options']['subOptions']['type'] == 'serial':
-				exists = False
-				for alias in serialInst:
-					if alias == i['id'] and serialInst[alias]['data'] == 'NMEA 0183' and serialInst[alias]['assignment'] == 'Signal K > OpenCPN':
-						exists = True
-				if not exists:
-					write = True
-					del self.data['pipedProviders'][count]
-			count = count + 1
-		#serial NMEA 2000 devices
-		for alias in serialInst:
-			if serialInst[alias]['data'] == 'NMEA 2000' and serialInst[alias]['assignment'] == 'Signal K > OpenCPN':
-				exists = False
-				if 'pipedProviders' in self.data:
-					count = 0
-					for i in self.data['pipedProviders']:
-						if i['id'] == alias:
-							exists = True
-							if i['pipeElements'][0]['options']['subOptions']['baudrate'] != int(serialInst[alias]['bauds']):
-								write = True
-								self.data['pipedProviders'][count]['pipeElements'][0]['options']['subOptions']['baudrate'] = int(serialInst[alias]['bauds'])
-						count = count + 1
-				if not exists:
-					self.data['pipedProviders'].append({'pipeElements': [{'type': 'providers/simple', 'options': {'logging': False, 'type': 'NMEA2000', 'subOptions': {'device': '/dev/'+alias, "baudrate": int(serialInst[alias]['bauds']), 'type': 'ngt-1-canboatjs'}}}], 'enabled': True, 'id': alias})
-					write = True
-		count = 0
-		for i in self.data['pipedProviders']:
-			if 'ttyOP_' in i['id'] and i['pipeElements'][0]['options']['subOptions']['type'] == 'ngt-1-canboatjs':
-				exists = False
-				for alias in serialInst:
-					if alias == i['id'] and serialInst[alias]['data'] == 'NMEA 2000' and serialInst[alias]['assignment'] == 'Signal K > OpenCPN':
-						exists = True
-				if not exists:
-					write = True
-					del self.data['pipedProviders'][count]
-			count = count + 1
+				path = self.conf.home + '/.pypilot/serial_ports'
+				try:
+					with open(path, 'r') as f:
+						for line in f:
+							line = line.replace('\n', '')
+							line = line.strip()
+							if self.alias == line: exists = True
+				except: pass
+				if exists: self.error = _('Failed. This device is already set in Pypilot')
+				else:
+					try:
+						with open(path, "a") as file:
+							file.write(self.alias + '\n')
+					except:	self.error = _('Failed. Error setting the device in Pypilot')
 
-		if write: self.write_settings()
-		return write
+				path = self.conf.home + '/.pypilot/'
+				tmp = os.listdir(path)
+				for i in tmp:
+					if i[:4] == 'nmea' and i[-6:] == 'device':
+						subprocess.call(['rm', '-f', path+i])
 
-	def write_settings(self):
-		data = ujson.dumps(self.data, indent=4, sort_keys=True)
-		try:
-			wififile = open(self.setting_file, 'w')
-			wififile.write(data.replace('\/','/'))
-			wififile.close()
-			self.load()
-		except: print('Error: error saving Signal K settings')
+			elif self.app == 'kplex': 
+				pass
+
+		self.EndModal(wx.ID_OK)
 
 ################################################################################
 
 def main():
 	app = wx.App()
 	SerialFrame().Show()
+	time.sleep(1.5)
 	app.MainLoop()
 
 if __name__ == '__main__':
